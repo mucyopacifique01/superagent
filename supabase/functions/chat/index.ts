@@ -89,17 +89,27 @@ Deno.serve(async (req: Request) => {
 
   try {
     const body = await req.json().catch(() => null);
+
+    const caller = await getCaller(req);
+    if (!caller) {
+      return json({ error: "Your session has expired. Please sign in again." }, 401);
+    }
+
+    const crew = getCrewConfig();
+
+    // Status poll: { jobId } — a crew run can take many minutes, so the browser
+    // polls instead of holding one long request open.
+    const jobId = typeof body?.jobId === "string" ? body.jobId.trim() : "";
+    if (jobId) {
+      return json(await readJob(jobId, crew));
+    }
+
     const message = body?.message;
     const model = typeof body?.model === "string" ? body.model : "gpt-4o";
     const history: HistoryTurn[] = Array.isArray(body?.history) ? body.history : [];
 
     if (!message || typeof message !== "string") {
       return json({ error: "Message is required" }, 400);
-    }
-
-    const caller = await getCaller(req);
-    if (!caller) {
-      return json({ error: "Your session has expired. Please sign in again." }, 401);
     }
 
     const used = await messagesSentToday(caller);
@@ -109,8 +119,6 @@ Deno.serve(async (req: Request) => {
         429,
       );
     }
-
-    const crew = getCrewConfig();
 
     const agentResponse = await fetch(`${crew.url}/kickoff`, {
       method: "POST",
@@ -147,12 +155,11 @@ Deno.serve(async (req: Request) => {
         : agentData?.uuid ?? agentData?.task_id ?? agentData?.id ?? agentData?.kickoff_id ?? null;
 
     if (taskId) {
-      const { reply, steps } = await pollAgentTask(taskId, crew);
-      return json({ reply, steps });
+      return json({ jobId: String(taskId), state: "STARTED" });
     }
 
     const { reply, steps } = extractResult(agentData);
-    return json({ reply, steps });
+    return json({ state: "COMPLETED", reply, steps });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal server error";
 
@@ -167,40 +174,51 @@ Deno.serve(async (req: Request) => {
   }
 });
 
-async function pollAgentTask(
-  taskId: string,
-  crew: { url: string; token: string },
-): Promise<{ reply: string; steps: AgentStep[] }> {
-  const maxAttempts = 55;
-  const intervalMs = 2000;
+async function readJob(jobId: string, crew: { url: string; token: string }) {
+  const res = await fetch(`${crew.url}/status/${encodeURIComponent(jobId)}`, {
+    method: "GET",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${crew.token}`,
+    },
+  });
 
-  for (let i = 0; i < maxAttempts; i++) {
-    await new Promise((resolve) => setTimeout(resolve, intervalMs));
-
-    const statusResponse = await fetch(`${crew.url}/status/${taskId}`, {
-      method: "GET",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${crew.token}`,
-      },
-    });
-
-    if (!statusResponse.ok) continue;
-
-    const statusData = await statusResponse.json();
-    const status = statusData?.status ?? statusData?.state ?? "pending";
-
-    if (status === "completed" || status === "success" || status === "finished" || status === "DONE") {
-      return extractResult(statusData);
-    }
-
-    if (status === "failed" || status === "error") {
-      const errMsg = statusData?.error ?? statusData?.message ?? "unknown error";
-      throw new Error(`Agent task failed: ${errMsg}`);
-    }
+  if (!res.ok) {
+    return { state: "RUNNING", error: null, progress: null };
   }
 
-  throw new Error("The agent team is taking longer than 2 minutes. Try a shorter request.");
+  const data = await res.json().catch(() => null);
+  if (!data || typeof data !== "object") {
+    return { state: "RUNNING", error: null, progress: null };
+  }
+
+  const d = data as Record<string, unknown>;
+  const rawState = String(d.state ?? "").toUpperCase();
+  const progress = normalizeProgress(d.progress);
+
+  if (rawState === "COMPLETED" || rawState === "SUCCESS" || rawState === "FINISHED") {
+    const { reply, steps } = extractResult(d);
+    return { state: "COMPLETED", reply, steps, progress, error: null };
+  }
+
+  if (rawState === "FAILED" || rawState === "ERROR" || rawState === "NOT FOUND") {
+    const detail = typeof d.status === "string" && d.status ? d.status : "The agent team failed.";
+    return { state: "FAILED", error: detail, progress, reply: null };
+  }
+
+  return { state: rawState === "PENDING" ? "PENDING" : "RUNNING", progress, error: null };
+}
+
+function normalizeProgress(value: unknown) {
+  if (!value || typeof value !== "object") return null;
+  const p = value as Record<string, unknown>;
+  return {
+    completed: typeof p.completed === "number" ? p.completed : null,
+    total: typeof p.total === "number" ? p.total : null,
+    current: typeof p.current === "string" ? p.current : null,
+    current_agent: typeof p.current_agent === "string" ? p.current_agent : null,
+    elapsed_seconds: typeof p.duration_seconds === "number" ? Math.round(p.duration_seconds) : null,
+  };
 }
 
 function toSteps(tasks: unknown[]): AgentStep[] {
@@ -234,7 +252,18 @@ function extractResult(data: unknown): { reply: string; steps: AgentStep[] } {
   if (obj.result && typeof obj.result === "object") {
     return extractTaskOutput(obj.result);
   }
-  if (typeof obj.result === "string") return { reply: obj.result, steps: [] };
+  if (typeof obj.result === "string" && obj.result.trim()) return { reply: obj.result, steps: [] };
+  if (typeof obj.result_json === "string" && obj.result_json.trim()) {
+    return { reply: obj.result_json, steps: [] };
+  }
+  if (obj.result_json && typeof obj.result_json === "object") {
+    return extractTaskOutput(obj.result_json);
+  }
+  if (Array.isArray(obj.results) && obj.results.length > 0) {
+    const steps = toSteps(obj.results);
+    const reply = steps.map((s) => `**${s.agent}:** ${s.content}`).join("\n\n");
+    return { reply, steps };
+  }
   if (typeof obj.output === "string") return { reply: obj.output, steps: [] };
   if (typeof obj.final_output === "string") return { reply: obj.final_output, steps: [] };
 

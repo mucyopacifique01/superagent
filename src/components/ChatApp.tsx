@@ -18,9 +18,9 @@ interface ChatAppProps {
 
 const REQUEST_TIMEOUT_MS = 150_000;
 
-async function fetchWithTimeout(input: string, init: RequestInit): Promise<Response> {
+async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (err) {
@@ -141,23 +141,101 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     URL.revokeObjectURL(url);
   };
 
-  const callApi = async (userMessage: string, history: { role: string; content: string }[]) => {
-    if (backend === 'fastapi') {
-      if (!FASTAPI_BASE) {
-        throw new Error('The local FastAPI backend is not configured for this deployment.');
-      }
-      return callFastApi(userMessage, history);
-    }
-    return callCrewAi(userMessage, history);
+  const crewEndpoint = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
+
+  const authHeaders = async () => {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData.session?.access_token;
+    return {
+      Authorization: `Bearer ${accessToken ?? import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+    };
   };
 
-  const callFastApi = async (userMessage: string, history: { role: string; content: string }[]) => {
-    const fastApiUrl = `${FASTAPI_BASE}/api/run-crew`;
-    const response = await fetchWithTimeout(fastApiUrl, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
+  // A crew run can take many minutes, so the backend returns a job id and we poll it.
+  const startCrewJob = async (userMessage: string, history: { role: string; content: string }[]) => {
+    const response = await fetchWithTimeout(
+      crewEndpoint,
+      {
+        method: 'POST',
+        headers: await authHeaders(),
+        body: JSON.stringify({ message: userMessage, history, model: selectedModel }),
       },
+      60_000,
+    );
+
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(data?.error ?? `Request failed (${response.status})`);
+    }
+    if (typeof data?.reply === 'string') {
+      return { jobId: null as string | null, reply: data.reply as string, steps: (data.steps ?? []) as AgentStep[] };
+    }
+    if (!data?.jobId) {
+      throw new Error('The server did not return a job id');
+    }
+    return { jobId: String(data.jobId), reply: null as string | null, steps: [] as AgentStep[] };
+  };
+
+  const pollCrewJob = async (jobId: string) => {
+    const response = await fetchWithTimeout(
+      crewEndpoint,
+      { method: 'POST', headers: await authHeaders(), body: JSON.stringify({ jobId }) },
+      45_000,
+    );
+    const data = await response.json().catch(() => null);
+    if (!response.ok) {
+      throw new Error(data?.error ?? `Request failed (${response.status})`);
+    }
+    return data as {
+      state: string;
+      reply?: string | null;
+      steps?: AgentStep[];
+      error?: string | null;
+      progress?: { completed: number | null; total: number | null; current: string | null; current_agent: string | null } | null;
+    };
+  };
+
+  const waitForCrewJob = async (jobId: string) => {
+    const deadline = Date.now() + 15 * 60 * 1000;
+
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 4000));
+
+      let status;
+      try {
+        status = await pollCrewJob(jobId);
+      } catch {
+        continue; // transient network hiccup, keep waiting
+      }
+
+      if (status.progress) {
+        const { completed, total, current_agent, current } = status.progress;
+        setAgentSteps([
+          {
+            agent: current_agent ?? current ?? 'Agent team working',
+            content: total ? `${completed ?? 0}/${total} tasks complete` : '',
+            status: 'active',
+          },
+        ]);
+      }
+
+      if (status.state === 'COMPLETED' && typeof status.reply === 'string') {
+        return { reply: status.reply, steps: status.steps ?? [] };
+      }
+      if (status.state === 'FAILED') {
+        throw new Error(status.error ?? 'The agent team failed.');
+      }
+    }
+
+    throw new Error('The agent team is still running after 15 minutes. Try a shorter request.');
+  };
+
+  // Optional local FastAPI crew backend (only used when VITE_FASTAPI_URL is set)
+  const callFastApi = async (userMessage: string, history: { role: string; content: string }[]) => {
+    const response = await fetchWithTimeout(`${FASTAPI_BASE}/api/run-crew`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ prompt: userMessage, model: selectedModel, history }),
     });
 
@@ -166,39 +244,10 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     }
 
     const data = await response.json();
-    if (data.status === 'success') {
-      return { reply: data.result as string, steps: [] as AgentStep[] };
+    if (data?.status === 'success') {
+      return { reply: String(data.result ?? ''), steps: [] as AgentStep[] };
     }
-    throw new Error(data.message ?? 'FastAPI returned an error');
-  };
-
-  const callCrewAi = async (userMessage: string, history: { role: string; content: string }[]) => {
-    const { data: sessionData } = await supabase.auth.getSession();
-    const accessToken = sessionData.session?.access_token;
-
-    const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
-    const response = await fetchWithTimeout(apiUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken ?? import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ message: userMessage, history, model: selectedModel }),
-    });
-
-    if (!response.ok) {
-      const errData = await response.json().catch(() => null);
-      throw new Error(errData?.error ?? `Request failed (${response.status})`);
-    }
-
-    const data = await response.json();
-    if (!data || typeof data.reply !== 'string') {
-      throw new Error('Invalid response from server');
-    }
-    return {
-      reply: data.reply as string,
-      steps: (data.steps ?? []) as AgentStep[],
-    };
+    throw new Error(data?.message ?? 'FastAPI returned an error');
   };
 
   const handleSend = async (text: string) => {
@@ -256,10 +305,27 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
         .slice(0, -1)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      const { reply, steps } = await callApi(text, history);
+      let reply: string;
+      let steps: AgentStep[] = [];
+
+      if (backend === 'fastapi' && FASTAPI_BASE) {
+        const result = await callFastApi(text, history);
+        reply = result.reply;
+        steps = result.steps;
+      } else {
+        const started = await startCrewJob(text, history);
+        if (started.reply !== null) {
+          reply = started.reply;
+          steps = started.steps;
+        } else {
+          const finished = await waitForCrewJob(started.jobId as string);
+          reply = finished.reply;
+          steps = finished.steps;
+        }
+      }
 
       // Only show steps the backend actually reported
-      setAgentSteps(steps && steps.length > 0 ? steps.map((s) => ({ ...s, status: 'done' })) : []);
+      setAgentSteps(steps.length > 0 ? steps.map((s) => ({ ...s, status: 'done' })) : []);
 
       const { data: aiMsgData, error: aiMsgError } = await supabase
         .from('messages')
