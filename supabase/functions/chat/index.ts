@@ -5,6 +5,29 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
+const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
+const DAILY_MESSAGE_LIMIT = Number(Deno.env.get("DAILY_MESSAGE_LIMIT") ?? "80");
+const MAX_HISTORY_TURNS = 12;
+
+interface AgentStep {
+  agent: string;
+  content: string;
+  status: "pending" | "active" | "done";
+}
+
+interface HistoryTurn {
+  role: string;
+  content: string;
+}
+
+function json(body: unknown, status = 200) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { ...corsHeaders, "Content-Type": "application/json" },
+  });
+}
+
 function getCrewConfig() {
   const url = Deno.env.get("CREWAI_URL")?.replace(/\/+$/, "");
   const token = Deno.env.get("CREWAI_TOKEN");
@@ -14,10 +37,49 @@ function getCrewConfig() {
   return { url, token };
 }
 
-interface AgentStep {
-  agent: string;
-  content: string;
-  status: "pending" | "active" | "done";
+// Verify the caller's Supabase session so an anonymous visitor can't spend crew credits.
+async function getCaller(req: Request): Promise<{ id: string; token: string } | null> {
+  const header = req.headers.get("Authorization") ?? "";
+  const token = header.replace(/^Bearer\s+/i, "").trim();
+  if (!token || token === SUPABASE_ANON_KEY) return null;
+
+  const res = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+    headers: { Authorization: `Bearer ${token}`, apikey: SUPABASE_ANON_KEY },
+  });
+  if (!res.ok) return null;
+  const user = await res.json().catch(() => null);
+  if (!user?.id) return null;
+  return { id: String(user.id), token };
+}
+
+// Count the caller's own messages sent today (RLS scopes the count to their chats).
+async function messagesSentToday(caller: { id: string; token: string }): Promise<number> {
+  const startOfDay = new Date();
+  startOfDay.setUTCHours(0, 0, 0, 0);
+  const url =
+    `${SUPABASE_URL}/rest/v1/messages?select=id&role=eq.user` +
+    `&created_at=gte.${encodeURIComponent(startOfDay.toISOString())}`;
+
+  const res = await fetch(url, {
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${caller.token}`,
+      Prefer: "count=exact",
+      Range: "0-0",
+    },
+  });
+  if (!res.ok) return 0;
+  const total = res.headers.get("content-range")?.split("/")?.[1];
+  const parsed = Number(total);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function formatHistory(history: HistoryTurn[]): string {
+  return history
+    .filter((turn) => turn && typeof turn.content === "string" && turn.content.trim().length > 0)
+    .slice(-MAX_HISTORY_TURNS)
+    .map((turn) => `${turn.role === "assistant" ? "Agent" : "User"}: ${turn.content.trim()}`)
+    .join("\n\n");
 }
 
 Deno.serve(async (req: Request) => {
@@ -26,18 +88,30 @@ Deno.serve(async (req: Request) => {
   }
 
   try {
-    const { message, model } = await req.json();
+    const body = await req.json().catch(() => null);
+    const message = body?.message;
+    const model = typeof body?.model === "string" ? body.model : "gpt-4o";
+    const history: HistoryTurn[] = Array.isArray(body?.history) ? body.history : [];
 
     if (!message || typeof message !== "string") {
-      return new Response(
-        JSON.stringify({ error: "Message is required" }),
-        { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } },
+      return json({ error: "Message is required" }, 400);
+    }
+
+    const caller = await getCaller(req);
+    if (!caller) {
+      return json({ error: "Your session has expired. Please sign in again." }, 401);
+    }
+
+    const used = await messagesSentToday(caller);
+    if (used >= DAILY_MESSAGE_LIMIT) {
+      return json(
+        { error: `You've reached today's limit of ${DAILY_MESSAGE_LIMIT} messages. Try again tomorrow.` },
+        429,
       );
     }
 
     const crew = getCrewConfig();
 
-    // Forward the user's text as project_description to the agent backend
     const agentResponse = await fetch(`${crew.url}/kickoff`, {
       method: "POST",
       headers: {
@@ -47,22 +121,20 @@ Deno.serve(async (req: Request) => {
       body: JSON.stringify({
         inputs: {
           project_description: message,
-          model: model ?? "gpt-4o",
+          conversation_history: formatHistory(history),
+          model,
         },
       }),
     });
 
     if (!agentResponse.ok) {
       const errorText = await agentResponse.text().catch(() => "");
-      return new Response(
-        JSON.stringify({
+      return json(
+        {
           error: `Agent request failed (${agentResponse.status})`,
           details: errorText.slice(0, 500),
-        }),
-        {
-          status: 502,
-          headers: { ...corsHeaders, "Content-Type": "application/json" },
         },
+        502,
       );
     }
 
@@ -70,29 +142,20 @@ Deno.serve(async (req: Request) => {
 
     // /kickoff returns a UUID; poll /status/:uuid for the result
     const taskId =
-      typeof agentData === "string" ? agentData :
-      agentData?.uuid ?? agentData?.task_id ?? agentData?.id ?? agentData?.kickoff_id ?? null;
+      typeof agentData === "string"
+        ? agentData
+        : agentData?.uuid ?? agentData?.task_id ?? agentData?.id ?? agentData?.kickoff_id ?? null;
 
     if (taskId) {
       const { reply, steps } = await pollAgentTask(taskId, crew);
-      return new Response(
-        JSON.stringify({ reply, steps }),
-        { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-      );
+      return json({ reply, steps });
     }
 
-    // If the agent returned a direct result, extract it
     const { reply, steps } = extractResult(agentData);
-    return new Response(
-      JSON.stringify({ reply, steps }),
-      { headers: { ...corsHeaders, "Content-Type": "application/json" } },
-    );
+    return json({ reply, steps });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal server error";
-    return new Response(
-      JSON.stringify({ error: message }),
-      { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } },
-    );
+    return json({ error: message }, 500);
   }
 });
 
@@ -100,7 +163,7 @@ async function pollAgentTask(
   taskId: string,
   crew: { url: string; token: string },
 ): Promise<{ reply: string; steps: AgentStep[] }> {
-  const maxAttempts = 60;
+  const maxAttempts = 55;
   const intervalMs = 2000;
 
   for (let i = 0; i < maxAttempts; i++) {
@@ -129,7 +192,19 @@ async function pollAgentTask(
     }
   }
 
-  throw new Error("Agent task timed out after 2 minutes");
+  throw new Error("The agent team is taking longer than 2 minutes. Try a shorter request.");
+}
+
+function toSteps(tasks: unknown[]): AgentStep[] {
+  return tasks.map((t, i) => {
+    if (typeof t === "string") {
+      return { agent: `Task ${i + 1}`, content: t, status: "done" as const };
+    }
+    const task = t as Record<string, unknown>;
+    const role = String(task?.agent ?? task?.role ?? `Task ${i + 1}`);
+    const content = String(task?.output ?? task?.result ?? task?.description ?? JSON.stringify(t));
+    return { agent: role, content, status: "done" as const };
+  });
 }
 
 function extractResult(data: unknown): { reply: string; steps: AgentStep[] } {
@@ -141,75 +216,34 @@ function extractResult(data: unknown): { reply: string; steps: AgentStep[] } {
   }
 
   const obj = data as Record<string, unknown>;
-  const steps: AgentStep[] = [];
 
-  // Extract steps from tasks_output if available
-  if (obj.tasks_output && Array.isArray(obj.tasks_output)) {
-    const taskSteps: AgentStep[] = obj.tasks_output.map((t: unknown, i: number) => {
-      if (typeof t === "string") {
-        return { agent: `Task ${i + 1}`, content: t, status: "done" as const };
-      }
-      const task = t as Record<string, unknown>;
-      const role = String(task?.agent ?? task?.role ?? `Task ${i + 1}`);
-      const content = String(task?.output ?? task?.result ?? task?.description ?? JSON.stringify(t));
-      return { agent: role, content, status: "done" as const };
-    });
-
-    const reply = taskSteps
-      .map((s) => `**${s.agent}:** ${s.content}`)
-      .join("\n\n");
-
-    return { reply, steps: taskSteps };
+  if (Array.isArray(obj.tasks_output)) {
+    const steps = toSteps(obj.tasks_output);
+    const reply = steps.map((s) => `**${s.agent}:** ${s.content}`).join("\n\n");
+    return { reply, steps };
   }
 
-  // Check for nested result object with tasks
   if (obj.result && typeof obj.result === "object") {
-    const nested = extractTaskOutput(obj.result);
-    return nested;
+    return extractTaskOutput(obj.result);
   }
-  if (obj.result && typeof obj.result === "string") {
-    return { reply: obj.result, steps: [] };
-  }
-  if (obj.output && typeof obj.output === "string") {
-    return { reply: obj.output, steps: [] };
-  }
-  if (obj.final_output && typeof obj.final_output === "string") {
-    return { reply: obj.final_output, steps: [] };
-  }
+  if (typeof obj.result === "string") return { reply: obj.result, steps: [] };
+  if (typeof obj.output === "string") return { reply: obj.output, steps: [] };
+  if (typeof obj.final_output === "string") return { reply: obj.final_output, steps: [] };
 
   return { reply: JSON.stringify(obj, null, 2), steps: [] };
 }
 
 function extractTaskOutput(result: unknown): { reply: string; steps: AgentStep[] } {
-  if (typeof result === "string") {
-    return { reply: result, steps: [] };
-  }
+  if (typeof result === "string") return { reply: result, steps: [] };
   if (typeof result === "object" && result !== null) {
     const obj = result as Record<string, unknown>;
-
-    if (obj.tasks_output && Array.isArray(obj.tasks_output)) {
-      const taskSteps: AgentStep[] = obj.tasks_output.map((t: unknown, i: number) => {
-        if (typeof t === "string") {
-          return { agent: `Task ${i + 1}`, content: t, status: "done" as const };
-        }
-        const task = t as Record<string, unknown>;
-        const role = String(task?.agent ?? task?.role ?? `Task ${i + 1}`);
-        const content = String(task?.output ?? task?.result ?? task?.description ?? JSON.stringify(t));
-        return { agent: role, content, status: "done" as const };
-      });
-
-      const reply = taskSteps
-        .map((s) => `**${s.agent}:** ${s.content}`)
-        .join("\n\n");
-
-      return { reply, steps: taskSteps };
+    if (Array.isArray(obj.tasks_output)) {
+      const steps = toSteps(obj.tasks_output);
+      const reply = steps.map((s) => `**${s.agent}:** ${s.content}`).join("\n\n");
+      return { reply, steps };
     }
-    if (obj.raw && typeof obj.raw === "string") {
-      return { reply: obj.raw, steps: [] };
-    }
-    if (obj.output && typeof obj.output === "string") {
-      return { reply: obj.output, steps: [] };
-    }
+    if (typeof obj.raw === "string") return { reply: obj.raw, steps: [] };
+    if (typeof obj.output === "string") return { reply: obj.output, steps: [] };
   }
   return { reply: JSON.stringify(result, null, 2), steps: [] };
 }

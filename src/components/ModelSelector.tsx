@@ -44,6 +44,7 @@ export function ModelSelector({ value, onChange, disabled }: ModelSelectorProps)
         disabled={disabled}
         className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 hover:bg-white/10 text-neutral-300 text-xs font-medium transition-colors border border-white/5 disabled:opacity-30 disabled:cursor-not-allowed"
         aria-label="Select AI model"
+        title="Model hint forwarded to your CrewAI crew"
       >
         <Cpu size={14} className="text-blue-400" />
         <span className="hidden sm:inline">{selected.name}</span>

@@ -16,6 +16,25 @@ interface ChatAppProps {
   onSignOut: () => void;
 }
 
+const REQUEST_TIMEOUT_MS = 150_000;
+
+async function fetchWithTimeout(input: string, init: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (err instanceof DOMException && err.name === 'AbortError') {
+      throw new Error('The request timed out. The agent team may still be finishing, try again.');
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+const FASTAPI_BASE = (import.meta.env.VITE_FASTAPI_URL as string | undefined)?.replace(/\/+$/, '');
+
 export function ChatApp({ user, onSignOut }: ChatAppProps) {
   const [chats, setChats] = useState<Chat[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -124,19 +143,22 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
 
   const callApi = async (userMessage: string, history: { role: string; content: string }[]) => {
     if (backend === 'fastapi') {
+      if (!FASTAPI_BASE) {
+        throw new Error('The local FastAPI backend is not configured for this deployment.');
+      }
       return callFastApi(userMessage, history);
     }
     return callCrewAi(userMessage, history);
   };
 
-  const callFastApi = async (userMessage: string, _history: { role: string; content: string }[]) => {
-    const fastApiUrl = `${import.meta.env.VITE_FASTAPI_URL ?? 'http://localhost:8000'}/api/run-crew`;
-    const response = await fetch(fastApiUrl, {
+  const callFastApi = async (userMessage: string, history: { role: string; content: string }[]) => {
+    const fastApiUrl = `${FASTAPI_BASE}/api/run-crew`;
+    const response = await fetchWithTimeout(fastApiUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ prompt: userMessage, model: selectedModel }),
+      body: JSON.stringify({ prompt: userMessage, model: selectedModel, history }),
     });
 
     if (!response.ok) {
@@ -155,7 +177,7 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     const accessToken = sessionData.session?.access_token;
 
     const apiUrl = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
-    const response = await fetch(apiUrl, {
+    const response = await fetchWithTimeout(apiUrl, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${accessToken ?? import.meta.env.VITE_SUPABASE_ANON_KEY}`,
@@ -226,44 +248,18 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
       currentMessages = [...currentMessages, userMsg];
       setMessages(currentMessages);
 
-      // Show initial agent steps while processing
-      setAgentSteps([
-        { agent: 'Analyzing your project description', content: '', status: 'active' },
-        { agent: 'Delegating to specialist agents', content: '', status: 'pending' },
-        { agent: 'Synthesizing recommendations', content: '', status: 'pending' },
-      ]);
+      // Honest progress: one working indicator until the backend replies
+      setAgentSteps([{ agent: 'Your agent team is working', content: '', status: 'active' }]);
 
-      // Simulate step progression while waiting for the response
-      const stepTimer1 = setTimeout(() => {
-        setAgentSteps((prev) => prev.map((s, i) =>
-          i === 0 ? { ...s, status: 'done', content: 'Project description parsed and analyzed.' } :
-          i === 1 ? { ...s, status: 'active' } : s
-        ));
-      }, 3000);
+      // Conversation memory: everything except the message we just sent
+      const history = currentMessages
+        .slice(0, -1)
+        .map((m) => ({ role: m.role, content: m.content }));
 
-      const stepTimer2 = setTimeout(() => {
-        setAgentSteps((prev) => prev.map((s, i) =>
-          i === 1 ? { ...s, status: 'done', content: 'Specialist agents have completed their analysis.' } :
-          i === 2 ? { ...s, status: 'active' } : s
-        ));
-      }, 8000);
-
-      const history = currentMessages.map((m) => ({ role: m.role, content: m.content }));
       const { reply, steps } = await callApi(text, history);
 
-      clearTimeout(stepTimer1);
-      clearTimeout(stepTimer2);
-
-      // Use real steps from the backend if available, otherwise mark all as done
-      if (steps && steps.length > 0) {
-        setAgentSteps(steps.map((s) => ({ ...s, status: 'done' })));
-      } else {
-        setAgentSteps((prev) => prev.map((s) => ({
-          ...s,
-          status: 'done',
-          content: s.content || 'Complete',
-        })));
-      }
+      // Only show steps the backend actually reported
+      setAgentSteps(steps && steps.length > 0 ? steps.map((s) => ({ ...s, status: 'done' })) : []);
 
       const { data: aiMsgData, error: aiMsgError } = await supabase
         .from('messages')
@@ -324,7 +320,9 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
           </div>
 
           <div className="flex items-center gap-2">
-            <BackendSelector value={backend} onChange={setBackend} disabled={loading} />
+            {FASTAPI_BASE && (
+              <BackendSelector value={backend} onChange={setBackend} disabled={loading} />
+            )}
             <ModelSelector value={selectedModel} onChange={setSelectedModel} disabled={loading} />
 
             <button
