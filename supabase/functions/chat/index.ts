@@ -5,7 +5,14 @@ const corsHeaders = {
   "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Client-Info, Apikey",
 };
 
-const AGENT_ENDPOINT = "https://paccy-software-agent-team-2ff6e418-0d6c-4e2-584992b1.crewai.com";
+function getCrewConfig() {
+  const url = Deno.env.get("CREWAI_URL")?.replace(/\/+$/, "");
+  const token = Deno.env.get("CREWAI_TOKEN");
+  if (!url || !token) {
+    throw new Error("CrewAI is not configured: CREWAI_URL and CREWAI_TOKEN must be set");
+  }
+  return { url, token };
+}
 
 interface AgentStep {
   agent: string;
@@ -28,11 +35,14 @@ Deno.serve(async (req: Request) => {
       );
     }
 
+    const crew = getCrewConfig();
+
     // Forward the user's text as project_description to the agent backend
-    const agentResponse = await fetch(`${AGENT_ENDPOINT}/kickoff`, {
+    const agentResponse = await fetch(`${crew.url}/kickoff`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
+        Authorization: `Bearer ${crew.token}`,
       },
       body: JSON.stringify({
         inputs: {
@@ -64,7 +74,7 @@ Deno.serve(async (req: Request) => {
       agentData?.uuid ?? agentData?.task_id ?? agentData?.id ?? agentData?.kickoff_id ?? null;
 
     if (taskId) {
-      const { reply, steps } = await pollAgentTask(taskId);
+      const { reply, steps } = await pollAgentTask(taskId, crew);
       return new Response(
         JSON.stringify({ reply, steps }),
         { headers: { ...corsHeaders, "Content-Type": "application/json" } },
@@ -86,16 +96,22 @@ Deno.serve(async (req: Request) => {
   }
 });
 
-async function pollAgentTask(taskId: string): Promise<{ reply: string; steps: AgentStep[] }> {
+async function pollAgentTask(
+  taskId: string,
+  crew: { url: string; token: string },
+): Promise<{ reply: string; steps: AgentStep[] }> {
   const maxAttempts = 60;
   const intervalMs = 2000;
 
   for (let i = 0; i < maxAttempts; i++) {
     await new Promise((resolve) => setTimeout(resolve, intervalMs));
 
-    const statusResponse = await fetch(`${AGENT_ENDPOINT}/status/${taskId}`, {
+    const statusResponse = await fetch(`${crew.url}/status/${taskId}`, {
       method: "GET",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${crew.token}`,
+      },
     });
 
     if (!statusResponse.ok) continue;
