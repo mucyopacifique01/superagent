@@ -155,6 +155,14 @@ Deno.serve(async (req: Request) => {
     return json({ reply, steps });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal server error";
+
+    if (message.includes("CrewAI is not configured")) {
+      return json(
+        { error: "The agent backend isn't connected yet. Add CREWAI_TOKEN to the project secrets." },
+        503,
+      );
+    }
+
     return json({ error: message }, 500);
   }
 });
