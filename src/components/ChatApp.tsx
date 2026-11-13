@@ -188,6 +188,11 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     let currentMessages = messages;
 
     try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      if (!sessionData.session) {
+        throw new Error('Your session has expired. Please sign in again.');
+      }
+
       if (!chatId) {
         const title = text.length > 40 ? text.slice(0, 40) + '...' : text;
         const { data: chatData, error: chatError } = await supabase
@@ -197,6 +202,7 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
           .single();
 
         if (chatError || !chatData) {
+          console.error('Creating chat failed', chatError);
           throw new Error('Failed to create chat');
         }
 
@@ -212,6 +218,7 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
         .single();
 
       if (userMsgError || !userMsgData) {
+        console.error('Saving user message failed', userMsgError);
         throw new Error('Failed to save message');
       }
 
@@ -265,6 +272,7 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
         .single();
 
       if (aiMsgError || !aiMsgData) {
+        console.error('Saving assistant message failed', aiMsgError);
         throw new Error('Failed to save assistant response');
       }
 
