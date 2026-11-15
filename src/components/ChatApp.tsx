@@ -1,38 +1,23 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
 import { Menu, Sparkles, AlertCircle, Download } from 'lucide-react';
 import { ModelSelector } from '@/components/ModelSelector';
+import { ModeSelector } from '@/components/ModeSelector';
 import { BackendSelector, type BackendType } from '@/components/BackendSelector';
 import type { User } from '@supabase/supabase-js';
 import { supabase } from '@/lib/supabase';
-import type { Chat, Message, AgentStep } from '@/types/chat';
+import type { Chat, Message, AgentStep, ChatMode, Routing, RunProgress, ServerConfig } from '@/types/chat';
 import { Sidebar } from '@/components/Sidebar';
 import { ChatMessage } from '@/components/ChatMessage';
 import { ChatInput } from '@/components/ChatInput';
-import { LoadingSpinner } from '@/components/LoadingSpinner';
-import { AgentSteps } from '@/components/AgentSteps';
+import { ProgressPanel } from '@/components/ProgressPanel';
 
 interface ChatAppProps {
   user: User;
   onSignOut: () => void;
 }
 
-const REQUEST_TIMEOUT_MS = 150_000;
-
-async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    return await fetch(input, { ...init, signal: controller.signal });
-  } catch (err) {
-    if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error('The request timed out. The agent team may still be finishing, try again.');
-    }
-    throw err;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
+const POLL_INTERVAL_MS = 4000;
+const ADVANCED_MAX_MS = 30 * 60 * 1000;
 const FASTAPI_BASE = (import.meta.env.VITE_FASTAPI_URL as string | undefined)?.replace(/\/+$/, '');
 
 export function ChatApp({ user, onSignOut }: ChatAppProps) {
@@ -42,18 +27,37 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [agentSteps, setAgentSteps] = useState<AgentStep[]>([]);
   const [selectedModel, setSelectedModel] = useState('gpt-4o');
   const [backend, setBackend] = useState<BackendType>('crewai');
+  const [mode, setMode] = useState<ChatMode>('auto');
+  const [routing, setRouting] = useState<Routing | null>(null);
+  const [progress, setProgress] = useState<RunProgress | null>(null);
+  const [streamingText, setStreamingText] = useState('');
+  const [elapsed, setElapsed] = useState(0);
+  const [config, setConfig] = useState<ServerConfig | null>(null);
+
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const abortRef = useRef<AbortController | null>(null);
+  const jobIdRef = useRef<string | null>(null);
+  const startedAtRef = useRef<number>(0);
+
+  const crewEndpoint = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
+
+  const authHeaders = useCallback(async () => {
+    const { data: sessionData } = await supabase.auth.getSession();
+    const accessToken = sessionData.session?.access_token;
+    return {
+      Authorization: `Bearer ${accessToken ?? import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+      'Content-Type': 'application/json',
+    };
+  }, []);
 
   const loadChats = useCallback(async () => {
-    const { data, error } = await supabase
+    const { data, error: err } = await supabase
       .from('chats')
       .select('*')
       .order('updated_at', { ascending: false });
-
-    if (error) {
+    if (err) {
       setError('Failed to load chat history');
       return;
     }
@@ -61,46 +65,89 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
   }, []);
 
   const loadMessages = useCallback(async (chatId: string) => {
-    const { data, error } = await supabase
+    const { data, error: err } = await supabase
       .from('messages')
       .select('*')
       .eq('chat_id', chatId)
       .order('created_at', { ascending: true });
-
-    if (error) {
+    if (err) {
       setError('Failed to load messages');
-      return;
+      return [];
     }
     setMessages(data as Message[]);
+    return data as Message[];
   }, []);
 
   useEffect(() => {
     loadChats();
   }, [loadChats]);
 
+  // Ask the backend what this deployment supports (fast mode needs a key).
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetch(crewEndpoint, {
+          method: 'POST',
+          headers: await authHeaders(),
+          body: JSON.stringify({ action: 'config' }),
+        });
+        if (res.ok) setConfig((await res.json()) as ServerConfig);
+      } catch {
+        // configuration is optional; the UI works without it
+      }
+    })();
+  }, [crewEndpoint, authHeaders]);
+
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages, loading, agentSteps]);
+  }, [messages, loading, streamingText, progress]);
 
-  const handleSelectChat = (chatId: string) => {
+  // Live elapsed timer while a request is in flight.
+  useEffect(() => {
+    if (!loading) return;
+    const id = setInterval(() => {
+      setElapsed((Date.now() - startedAtRef.current) / 1000);
+    }, 500);
+    return () => clearInterval(id);
+  }, [loading]);
+
+  const resetRun = useCallback(() => {
+    setRouting(null);
+    setProgress(null);
+    setStreamingText('');
+    setElapsed(0);
+    jobIdRef.current = null;
+  }, []);
+
+  const handleSelectChat = async (chatId: string) => {
     setActiveChatId(chatId);
     setSidebarOpen(false);
     setError(null);
-    setAgentSteps([]);
-    loadMessages(chatId);
+    resetRun();
+    const loaded = await loadMessages(chatId);
+    // A reply that is still being produced by the crew: reattach and keep watching.
+    const running = loaded.find((m) => m.status === 'running' && m.job_id);
+    if (running?.job_id) {
+      setMode('advanced');
+      setLoading(true);
+      startedAtRef.current = Date.now();
+      void pollAdvanced(chatId, running.job_id);
+    }
   };
 
   const handleNewChat = () => {
+    abortRef.current?.abort();
     setActiveChatId(null);
     setMessages([]);
     setSidebarOpen(false);
     setError(null);
-    setAgentSteps([]);
+    setLoading(false);
+    resetRun();
   };
 
   const handleDeleteChat = async (chatId: string) => {
-    const { error } = await supabase.from('chats').delete().eq('id', chatId);
-    if (error) {
+    const { error: err } = await supabase.from('chats').delete().eq('id', chatId);
+    if (err) {
       setError('Failed to delete chat');
       return;
     }
@@ -113,21 +160,16 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
 
   const handleExport = () => {
     if (messages.length === 0) return;
-
     const activeChat = chats.find((c) => c.id === activeChatId);
     const title = activeChat?.title ?? 'conversation';
     const date = new Date().toISOString().split('T')[0];
 
-    let markdown = `# Super Agent — ${title}\n\n`;
-    markdown += `_Exported on ${new Date().toLocaleString()}_\n\n---\n\n`;
-
+    let markdown = `# Super Agent — ${title}\n\n_Exported on ${new Date().toLocaleString()}_\n\n---\n\n`;
     for (const msg of messages) {
       const isUser = msg.role === 'user';
-      const sender = isUser ? '**You**' : '**Super Agent**';
-      const timestamp = new Date(msg.created_at).toLocaleTimeString();
-      markdown += `### ${sender}\n`;
-      markdown += `_${timestamp}_\n\n`;
-      markdown += `${msg.content}\n\n---\n\n`;
+      const tag = msg.mode ? ` · ${msg.mode}` : '';
+      const ms = msg.latency_ms ? ` · ${(msg.latency_ms / 1000).toFixed(1)}s` : '';
+      markdown += `### ${isUser ? '**You**' : '**Super Agent**'}\n_${new Date(msg.created_at).toLocaleTimeString()}${tag}${ms}_\n\n${msg.content}\n\n---\n\n`;
     }
 
     const blob = new Blob([markdown], { type: 'text/markdown' });
@@ -141,142 +183,123 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     URL.revokeObjectURL(url);
   };
 
-  const crewEndpoint = `${import.meta.env.VITE_SUPABASE_URL}/functions/v1/chat`;
-
-  const authHeaders = async () => {
-    const { data: sessionData } = await supabase.auth.getSession();
-    const accessToken = sessionData.session?.access_token;
-    return {
-      Authorization: `Bearer ${accessToken ?? import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-      'Content-Type': 'application/json',
-    };
-  };
-
-  // A crew run can take many minutes, so the backend returns a job id and we poll it.
-  const startCrewJob = async (userMessage: string, history: { role: string; content: string }[]) => {
-    const response = await fetchWithTimeout(
-      crewEndpoint,
-      {
-        method: 'POST',
-        headers: await authHeaders(),
-        body: JSON.stringify({ message: userMessage, history, model: selectedModel }),
-      },
-      60_000,
-    );
-
-    const data = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw new Error(data?.error ?? `Request failed (${response.status})`);
-    }
-    if (typeof data?.reply === 'string') {
-      return { jobId: null as string | null, reply: data.reply as string, steps: (data.steps ?? []) as AgentStep[] };
-    }
-    if (!data?.jobId) {
-      throw new Error('The server did not return a job id');
-    }
-    return { jobId: String(data.jobId), reply: null as string | null, steps: [] as AgentStep[] };
-  };
-
-  const pollCrewJob = async (jobId: string) => {
-    const response = await fetchWithTimeout(
-      crewEndpoint,
-      { method: 'POST', headers: await authHeaders(), body: JSON.stringify({ jobId }) },
-      45_000,
-    );
-    const data = await response.json().catch(() => null);
-    if (!response.ok) {
-      throw new Error(data?.error ?? `Request failed (${response.status})`);
-    }
-    return data as {
-      state: string;
-      reply?: string | null;
-      steps?: AgentStep[];
-      error?: string | null;
-      progress?: { completed: number | null; total: number | null; current: string | null; current_agent: string | null } | null;
-    };
-  };
-
-  const waitForCrewJob = async (jobId: string) => {
-    const deadline = Date.now() + 15 * 60 * 1000;
+  // ---- advanced runs: kickoff already returned a job id, so watch it ----
+  const pollAdvanced = async (chatId: string, jobId: string) => {
+    jobIdRef.current = jobId;
+    const deadline = Date.now() + ADVANCED_MAX_MS;
 
     while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 4000));
+      if (abortRef.current?.signal.aborted) break;
+      await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+      if (abortRef.current?.signal.aborted) break;
 
-      let status;
+      let status: { state: string; reply?: string | null; error?: string | null; progress?: RunProgress | null } | null = null;
       try {
-        status = await pollCrewJob(jobId);
+        const res = await fetch(crewEndpoint, {
+          method: 'POST',
+          headers: await authHeaders(),
+          body: JSON.stringify({ jobId }),
+        });
+        if (!res.ok) continue;
+        status = await res.json();
       } catch {
-        continue; // transient network hiccup, keep waiting
+        continue; // transient, keep waiting
       }
+      if (!status) continue;
 
-      if (status.progress) {
-        const { completed, total, current_agent, current } = status.progress;
-        setAgentSteps([
-          {
-            agent: current_agent ?? current ?? 'Agent team working',
-            content: total ? `${completed ?? 0}/${total} tasks complete` : '',
-            status: 'active',
-          },
-        ]);
-      }
+      if (status.progress) setProgress(status.progress);
 
-      if (status.state === 'COMPLETED' && typeof status.reply === 'string') {
-        return { reply: status.reply, steps: status.steps ?? [] };
+      if (status.state === 'COMPLETED' || status.state === 'CANCELLED') {
+        await loadMessages(chatId);
+        await loadChats();
+        return;
       }
       if (status.state === 'FAILED') {
+        await loadMessages(chatId);
         throw new Error(status.error ?? 'The agent team failed.');
       }
     }
 
-    throw new Error('The agent team is still running after 15 minutes. Try a shorter request.');
+    if (!abortRef.current?.signal.aborted) {
+      throw new Error('The agent team is still running after 30 minutes. Try a narrower request.');
+    }
   };
 
-  // Optional local FastAPI crew backend (only used when VITE_FASTAPI_URL is set)
-  const callFastApi = async (userMessage: string, history: { role: string; content: string }[]) => {
-    const response = await fetchWithTimeout(`${FASTAPI_BASE}/api/run-crew`, {
+  // ---- fast mode: stream the answer as it is written ----
+  const consumeStream = async (res: Response) => {
+    const reader = res.body?.getReader();
+    if (!reader) throw new Error('The server did not return a stream');
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const frames = buffer.split('\n\n');
+      buffer = frames.pop() ?? '';
+
+      for (const frame of frames) {
+        const line = frame.trim();
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload) continue;
+
+        let event: Record<string, unknown>;
+        try {
+          event = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+
+        if (event.type === 'routing' && event.routing) {
+          setRouting(event.routing as Routing);
+        } else if (event.type === 'delta' && typeof event.delta === 'string') {
+          setStreamingText((prev) => prev + (event.delta as string));
+        } else if (event.type === 'done') {
+          if (typeof event.reply === 'string') setStreamingText(event.reply);
+        }
+      }
+    }
+  };
+
+  const legacyFastApi = async (text: string, history: { role: string; content: string }[]) => {
+    const res = await fetch(`${FASTAPI_BASE}/api/run-crew`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ prompt: userMessage, model: selectedModel, history }),
+      body: JSON.stringify({ prompt: text, model: selectedModel, history }),
     });
-
-    if (!response.ok) {
-      throw new Error(`FastAPI request failed (${response.status})`);
-    }
-
-    const data = await response.json();
-    if (data?.status === 'success') {
-      return { reply: String(data.result ?? ''), steps: [] as AgentStep[] };
-    }
+    if (!res.ok) throw new Error(`FastAPI request failed (${res.status})`);
+    const data = await res.json();
+    if (data?.status === 'success') return String(data.result ?? '');
     throw new Error(data?.message ?? 'FastAPI returned an error');
   };
 
   const handleSend = async (text: string) => {
     setError(null);
     setLoading(true);
-    setAgentSteps([]);
+    resetRun();
+    startedAtRef.current = Date.now();
+    setElapsed(0);
+
+    const controller = new AbortController();
+    abortRef.current = controller;
 
     let chatId = activeChatId;
     let currentMessages = messages;
 
     try {
       const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData.session) {
-        throw new Error('Your session has expired. Please sign in again.');
-      }
+      if (!sessionData.session) throw new Error('Your session has expired. Please sign in again.');
 
       if (!chatId) {
-        const title = text.length > 40 ? text.slice(0, 40) + '...' : text;
+        const title = text.length > 40 ? `${text.slice(0, 40)}...` : text;
         const { data: chatData, error: chatError } = await supabase
           .from('chats')
           .insert({ title })
           .select()
           .single();
-
-        if (chatError || !chatData) {
-          console.error('Creating chat failed', chatError);
-          throw new Error('Failed to create chat');
-        }
-
+        if (chatError || !chatData) throw new Error('Failed to create chat');
         chatId = (chatData as Chat).id;
         setActiveChatId(chatId);
         loadChats();
@@ -287,73 +310,86 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
         .insert({ chat_id: chatId, role: 'user', content: text })
         .select()
         .single();
-
-      if (userMsgError || !userMsgData) {
-        console.error('Saving user message failed', userMsgError);
-        throw new Error('Failed to save message');
-      }
+      if (userMsgError || !userMsgData) throw new Error('Failed to save message');
 
       const userMsg = userMsgData as Message;
       currentMessages = [...currentMessages, userMsg];
       setMessages(currentMessages);
 
-      // Honest progress: one working indicator until the backend replies
-      setAgentSteps([{ agent: 'Your agent team is working', content: '', status: 'active' }]);
-
-      // Conversation memory: everything except the message we just sent
       const history = currentMessages
         .slice(0, -1)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      let reply: string;
-      let steps: AgentStep[] = [];
-
       if (backend === 'fastapi' && FASTAPI_BASE) {
-        const result = await callFastApi(text, history);
-        reply = result.reply;
-        steps = result.steps;
+        const reply = await legacyFastApi(text, history);
+        await supabase.from('messages').insert({ chat_id: chatId, role: 'assistant', content: reply });
       } else {
-        const started = await startCrewJob(text, history);
-        if (started.reply !== null) {
-          reply = started.reply;
-          steps = started.steps;
+        const wantStream = mode !== 'advanced';
+        const res = await fetch(crewEndpoint, {
+          method: 'POST',
+          headers: await authHeaders(),
+          signal: controller.signal,
+          body: JSON.stringify({ message: text, chatId, history, mode, stream: wantStream }),
+        });
+
+        const contentType = res.headers.get('content-type') ?? '';
+
+        if (res.ok && contentType.includes('text/event-stream')) {
+          await consumeStream(res);
+          await loadMessages(chatId);
         } else {
-          const finished = await waitForCrewJob(started.jobId as string);
-          reply = finished.reply;
-          steps = finished.steps;
+          const data = await res.json().catch(() => null);
+          if (!res.ok) {
+            throw new Error(data?.error ?? `Request failed (${res.status})`);
+          }
+          if (data?.routing) setRouting(data.routing as Routing);
+
+          if (data?.state === 'STARTED' && data?.jobId) {
+            jobIdRef.current = String(data.jobId);
+            await pollAdvanced(chatId, String(data.jobId));
+          } else {
+            await loadMessages(chatId);
+          }
         }
+        await loadChats();
       }
-
-      // Only show steps the backend actually reported
-      setAgentSteps(steps.length > 0 ? steps.map((s) => ({ ...s, status: 'done' })) : []);
-
-      const { data: aiMsgData, error: aiMsgError } = await supabase
-        .from('messages')
-        .insert({ chat_id: chatId, role: 'assistant', content: reply })
-        .select()
-        .single();
-
-      if (aiMsgError || !aiMsgData) {
-        console.error('Saving assistant message failed', aiMsgError);
-        throw new Error('Failed to save assistant response');
-      }
-
-      setMessages((prev) => [...prev, aiMsgData as Message]);
-
-      await supabase
-        .from('chats')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', chatId);
-
-      loadChats();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Something went wrong';
-      setError(msg);
-      setAgentSteps([]);
+      if (err instanceof DOMException && err.name === 'AbortError') {
+        setError(null);
+      } else {
+        setError(err instanceof Error ? err.message : 'Something went wrong');
+      }
+      if (chatId) await loadMessages(chatId);
     } finally {
+      if (abortRef.current === controller) abortRef.current = null;
+      jobIdRef.current = null;
       setLoading(false);
+      setStreamingText('');
     }
   };
+
+  const handleStop = async () => {
+    const jobId = jobIdRef.current;
+    abortRef.current?.abort();
+    setLoading(false);
+    setStreamingText('');
+    setProgress(null);
+
+    if (jobId) {
+      try {
+        await fetch(crewEndpoint, {
+          method: 'POST',
+          headers: await authHeaders(),
+          body: JSON.stringify({ action: 'stop', jobId }),
+        });
+      } catch {
+        // stopping locally already worked; the crew may finish in the background
+      }
+      if (activeChatId) await loadMessages(activeChatId);
+    }
+  };
+
+  const fastAvailable = config ? config.fast.configured : true;
 
   return (
     <div className="flex h-screen bg-[#0f0f0f] text-neutral-100 overflow-hidden">
@@ -378,19 +414,22 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
           >
             <Menu size={20} />
           </button>
-          <div className="flex items-center gap-2 flex-1">
-            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-emerald-500 flex items-center justify-center">
+          <div className="flex items-center gap-2 flex-1 min-w-0">
+            <div className="w-7 h-7 rounded-lg bg-gradient-to-br from-blue-500 to-emerald-500 flex items-center justify-center shrink-0">
               <Sparkles size={15} className="text-white" />
             </div>
             <span className="text-sm font-semibold text-neutral-200">Super Agent</span>
+            {config?.fast.configured && (
+              <span className="hidden md:inline text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 font-medium">
+                {config.fast.model}
+              </span>
+            )}
           </div>
 
           <div className="flex items-center gap-2">
-            {FASTAPI_BASE && (
-              <BackendSelector value={backend} onChange={setBackend} disabled={loading} />
-            )}
+            {FASTAPI_BASE && <BackendSelector value={backend} onChange={setBackend} disabled={loading} />}
+            <ModeSelector value={mode} onChange={setMode} disabled={loading} fastAvailable={fastAvailable} />
             <ModelSelector value={selectedModel} onChange={setSelectedModel} disabled={loading} />
-
             <button
               onClick={handleExport}
               disabled={messages.length === 0}
@@ -411,12 +450,10 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
                 <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500 to-emerald-500 flex items-center justify-center mb-4">
                   <Sparkles size={26} className="text-white" />
                 </div>
-                <h2 className="text-xl font-semibold text-neutral-200 mb-2">
-                  Describe your project
-                </h2>
+                <h2 className="text-xl font-semibold text-neutral-200 mb-2">Ask anything</h2>
                 <p className="text-sm text-neutral-500 max-w-md">
-                  Type a project description below and I'll help you analyze scope,
-                  architecture, and development approach.
+                  Questions and code get a fast, direct answer. Architecture, audits and
+                  business research go to the full agent team automatically.
                 </p>
               </div>
             )}
@@ -425,10 +462,28 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
               <ChatMessage key={msg.id} message={msg} />
             ))}
 
-            {loading && <LoadingSpinner steps={agentSteps} />}
+            {loading && (
+              <ProgressPanel
+                routing={routing}
+                progress={progress}
+                elapsedSeconds={elapsed}
+                streaming={streamingText.length > 0}
+                onStop={handleStop}
+              />
+            )}
 
-            {!loading && agentSteps.length > 0 && (
-              <AgentSteps steps={agentSteps} />
+            {loading && streamingText.length > 0 && (
+              <ChatMessage
+                message={{
+                  id: 'streaming',
+                  chat_id: activeChatId ?? '',
+                  role: 'assistant',
+                  content: streamingText,
+                  created_at: new Date().toISOString(),
+                  mode: 'fast',
+                  status: 'running',
+                }}
+              />
             )}
 
             {error && (
@@ -442,8 +497,10 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
           </div>
         </div>
 
-        <ChatInput onSend={handleSend} disabled={loading} />
+        <ChatInput onSend={handleSend} onStop={handleStop} disabled={loading} />
       </main>
     </div>
   );
 }
+
+export type { AgentStep };

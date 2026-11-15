@@ -1,5 +1,5 @@
 import type { ReactNode } from 'react';
-import { User, Bot } from 'lucide-react';
+import { User, Bot, Zap, Telescope, Loader2, Ban } from 'lucide-react';
 import type { Message } from '@/types/chat';
 
 interface ChatMessageProps {
@@ -19,15 +19,63 @@ export function ChatMessage({ message }: ChatMessageProps) {
         {isUser ? <User size={16} /> : <Bot size={16} />}
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-xs font-semibold mb-1 text-neutral-400">
-          {isUser ? 'You' : 'Assistant'}
-        </p>
+        <div className="flex items-center gap-2 mb-1">
+          <p className="text-xs font-semibold text-neutral-400">{isUser ? 'You' : 'Assistant'}</p>
+          {!isUser && message.mode && (
+            <span
+              className={`inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded ${
+                message.mode === 'fast'
+                  ? 'bg-emerald-500/10 text-emerald-400'
+                  : 'bg-blue-500/10 text-blue-400'
+              }`}
+              title={message.category ? `Classified as ${message.category}` : undefined}
+            >
+              {message.mode === 'fast' ? <Zap size={9} /> : <Telescope size={9} />}
+              {message.mode}
+              {message.latency_ms ? ` · ${formatLatency(message.latency_ms)}` : ''}
+            </span>
+          )}
+          {!isUser && message.status === 'running' && (
+            <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400">
+              <Loader2 size={9} className="animate-spin" />
+              running
+            </span>
+          )}
+          {!isUser && message.status === 'cancelled' && (
+            <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-500/10 text-neutral-400">
+              <Ban size={9} />
+              stopped
+            </span>
+          )}
+          {!isUser && message.status === 'failed' && (
+            <span className="inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wide px-1.5 py-0.5 rounded bg-red-500/10 text-red-400">
+              failed
+            </span>
+          )}
+        </div>
         <div className="text-sm text-neutral-200 leading-relaxed break-words space-y-2">
-          {isUser ? <p className="whitespace-pre-wrap">{message.content}</p> : renderMarkdown(message.content)}
+          {isUser ? (
+            <p className="whitespace-pre-wrap">{message.content}</p>
+          ) : message.content ? (
+            renderMarkdown(message.content)
+          ) : (
+            <p className="text-neutral-500 italic">
+              {message.status === 'cancelled' ? 'Stopped before an answer was saved.' : 'Waiting for the agent team...'}
+            </p>
+          )}
         </div>
       </div>
     </div>
   );
+}
+
+function formatLatency(ms: number) {
+  const seconds = ms / 1000;
+  if (seconds < 10) return `${seconds.toFixed(1)}s`;
+  if (seconds < 60) return `${Math.round(seconds)}s`;
+  const m = Math.floor(seconds / 60);
+  const s = Math.round(seconds % 60);
+  return s ? `${m}m ${s}s` : `${m}m`;
 }
 
 const INLINE = /(\*\*[^*]+\*\*|`[^`]+`|\[[^\]]+\]\([^)\s]+\))/g;
