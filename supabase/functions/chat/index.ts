@@ -23,8 +23,8 @@ const HISTORY_CHAR_BUDGET = 6000;
 // Fast path: any OpenAI-compatible endpoint. Defaults to Groq.
 const FAST_API_KEY = Deno.env.get("GROQ_API_KEY") ?? Deno.env.get("FAST_LLM_API_KEY") ?? "";
 const FAST_BASE_URL = (Deno.env.get("FAST_LLM_BASE_URL") ?? "https://api.groq.com/openai/v1").replace(/\/+$/, "");
-const FAST_MODEL = Deno.env.get("FAST_LLM_MODEL") ?? "llama-3.3-70b-versatile";
-const FAST_MODEL_DEEP = Deno.env.get("FAST_LLM_MODEL_DEEP") ?? FAST_MODEL;
+const FAST_MODEL = Deno.env.get("FAST_LLM_MODEL") ?? "openai/gpt-oss-120b";
+const FAST_MODEL_DEEP = Deno.env.get("FAST_LLM_MODEL_DEEP") ?? "openai/gpt-oss-120b";
 const FAST_MAX_TOKENS = Number(Deno.env.get("FAST_MAX_TOKENS") ?? "900");
 const FAST_TIMEOUT_MS = Number(Deno.env.get("FAST_TIMEOUT_MS") ?? "60000");
 
@@ -186,6 +186,9 @@ const COMPLEX_HINTS = [
   "step by step plan", "project plan", "sprint plan", "production ready",
 ];
 
+const RESEARCH_WORDS = /\b(competitive|competition|competitors?|industry|industries|market|markets|trends?|opportunit(?:y|ies)|outlook|growth|startups?|landscape|positioning|demand|adoption|sector)\b/g;
+const RESEARCH_PHRASES = /\b(summarize|summarise|analyze|analyse|compare)\b[^.!?]{0,40}\b(market|industry|sector|competitors?|competition|business|startups?)\b/;
+
 const CODING_HINTS = [
   "```", "function", "bug", "error", "exception", "traceback", "stack trace", "compile",
   "typescript", "javascript", "python", "react", "sql", "regex", "api endpoint",
@@ -218,7 +221,11 @@ function classify(message: string, forced: string | undefined): Routing {
     };
   }
 
-  const research = hits(text, RESEARCH_HINTS);
+  const research = [
+    ...hits(text, RESEARCH_HINTS),
+    ...(text.match(RESEARCH_WORDS) ?? []),
+    ...(RESEARCH_PHRASES.test(text) ? ["analysis request"] : []),
+  ];
   const complex = hits(text, COMPLEX_HINTS);
   const coding = hits(text, CODING_HINTS);
   const technical = hits(text, TECHNICAL_HINTS);
@@ -275,6 +282,8 @@ never restate the question, never describe what you are about to do.
 Rules:
 - Default length: 60-120 words. Go longer only when the user asks for detail, or when
   the question truly needs steps, code, or a comparison.
+- Always write at least one full sentence with a brief reason or context. Never answer
+  with a bare fact, a single word, or a fragment.
 - Professional, plain language. Short paragraphs, bullets for steps, fenced code with a
   language tag for code.
 - Be factually accurate. If something depends on an unknown (a version, a price, a

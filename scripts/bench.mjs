@@ -157,7 +157,14 @@ const rows = [];
 for (const prompt of PROMPTS) {
   const result = await runStreaming(token, chatId, prompt.text);
   if (result.kind === 'advanced') {
-    rows.push({ prompt: prompt.label, route: 'advanced (not executed)', seconds: '-', note: result.data?.routing?.reason ?? '' });
+    // Do not let a benchmark burn a 6-task crew run: record the route and stop it.
+    if (result.data?.jobId) await call(token, { action: 'stop', jobId: result.data.jobId });
+    rows.push({
+      prompt: prompt.label,
+      route: 'advanced (routed, stopped)',
+      seconds: '-',
+      note: result.data?.routing?.reason ?? '',
+    });
     continue;
   }
   rows.push({

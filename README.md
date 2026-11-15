@@ -62,8 +62,8 @@ Do not skip them.
 supabase secrets set GROQ_API_KEY=gsk_...
 # optional: override provider, models and limits
 supabase secrets set FAST_LLM_BASE_URL=https://api.groq.com/openai/v1
-supabase secrets set FAST_LLM_MODEL=llama-3.3-70b-versatile
-supabase secrets set FAST_LLM_MODEL_DEEP=llama-3.3-70b-versatile
+supabase secrets set FAST_LLM_MODEL=openai/gpt-oss-120b
+supabase secrets set FAST_LLM_MODEL_DEEP=openai/gpt-oss-120b
 supabase secrets set FAST_MAX_TOKENS=900
 supabase secrets set FAST_TIMEOUT_MS=60000
 
