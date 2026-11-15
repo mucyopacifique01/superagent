@@ -1,4 +1,5 @@
-// Chat edge function — proxies project descriptions to the Super Agent backend (CrewAI)
+// Chat edge function: starts a CrewAI kickoff and tracks it in chat_jobs.
+// The browser polls with { jobId }; the assistant reply is saved here exactly once.
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
@@ -9,6 +10,8 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL") ?? "";
 const SUPABASE_ANON_KEY = Deno.env.get("SUPABASE_ANON_KEY") ?? "";
 const DAILY_MESSAGE_LIMIT = Number(Deno.env.get("DAILY_MESSAGE_LIMIT") ?? "80");
 const MAX_HISTORY_TURNS = 12;
+const MAX_JOB_AGE_MS = 2 * 60 * 60 * 1000;
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 interface AgentStep {
   agent: string;
@@ -19,6 +22,41 @@ interface AgentStep {
 interface HistoryTurn {
   role: string;
   content: string;
+}
+
+interface Caller {
+  id: string;
+  token: string;
+}
+
+interface Progress {
+  completed: number | null;
+  total: number | null;
+  current: string | null;
+  current_agent: string | null;
+  elapsed_seconds: number | null;
+}
+
+interface ChatJob {
+  id: string;
+  chat_id: string;
+  crew_job_id: string | null;
+  status: string;
+  progress: Progress | null;
+  steps: AgentStep[] | null;
+  result: string | null;
+  error: string | null;
+  reply_saved: boolean;
+  assistant_message_id: string | null;
+  created_at: string;
+}
+
+interface PollResult {
+  state: string;
+  progress?: Progress | null;
+  reply?: string;
+  steps?: AgentStep[];
+  error?: string | null;
 }
 
 function json(body: unknown, status = 200) {
@@ -38,7 +76,7 @@ function getCrewConfig() {
 }
 
 // Verify the caller's Supabase session so an anonymous visitor can't spend crew credits.
-async function getCaller(req: Request): Promise<{ id: string; token: string } | null> {
+async function getCaller(req: Request): Promise<Caller | null> {
   const header = req.headers.get("Authorization") ?? "";
   const token = header.replace(/^Bearer\s+/i, "").trim();
   if (!token || token === SUPABASE_ANON_KEY) return null;
@@ -52,8 +90,28 @@ async function getCaller(req: Request): Promise<{ id: string; token: string } | 
   return { id: String(user.id), token };
 }
 
+// Calls PostgREST as the caller so row level security applies to every read and write.
+function rest(caller: Caller, path: string, init: { method: string; body?: unknown; prefer?: string }) {
+  return fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    method: init.method,
+    headers: {
+      apikey: SUPABASE_ANON_KEY,
+      Authorization: `Bearer ${caller.token}`,
+      "Content-Type": "application/json",
+      ...(init.prefer ? { Prefer: init.prefer } : {}),
+    },
+    body: init.body === undefined ? undefined : JSON.stringify(init.body),
+  });
+}
+
+async function readRows<T>(res: Response): Promise<T[]> {
+  if (!res.ok) return [];
+  const data = await res.json().catch(() => []);
+  return Array.isArray(data) ? (data as T[]) : [];
+}
+
 // Count the caller's own messages sent today (RLS scopes the count to their chats).
-async function messagesSentToday(caller: { id: string; token: string }): Promise<number> {
+async function messagesSentToday(caller: Caller): Promise<number> {
   const startOfDay = new Date();
   startOfDay.setUTCHours(0, 0, 0, 0);
   const url =
@@ -82,6 +140,192 @@ function formatHistory(history: HistoryTurn[]): string {
     .join("\n\n");
 }
 
+async function createJob(caller: Caller, chatId: string): Promise<ChatJob | null> {
+  const rows = await readRows<ChatJob>(
+    await rest(caller, "chat_jobs", {
+      method: "POST",
+      body: { chat_id: chatId, status: "STARTING" },
+      prefer: "return=representation",
+    }),
+  );
+  return rows[0] ?? null;
+}
+
+async function loadJob(caller: Caller, jobId: string): Promise<ChatJob | null> {
+  const rows = await readRows<ChatJob>(
+    await rest(caller, `chat_jobs?id=eq.${jobId}&select=*`, { method: "GET" }),
+  );
+  return rows[0] ?? null;
+}
+
+async function updateJob(
+  caller: Caller,
+  jobId: string,
+  patch: Record<string, unknown>,
+  extraFilter = "",
+): Promise<ChatJob[]> {
+  return readRows<ChatJob>(
+    await rest(caller, `chat_jobs?id=eq.${jobId}${extraFilter}`, {
+      method: "PATCH",
+      body: { ...patch, updated_at: new Date().toISOString() },
+      prefer: "return=representation",
+    }),
+  );
+}
+
+async function insertAssistantMessage(caller: Caller, chatId: string, content: string) {
+  const rows = await readRows<{ id: string }>(
+    await rest(caller, "messages", {
+      method: "POST",
+      body: { chat_id: chatId, role: "assistant", content },
+      prefer: "return=representation",
+    }),
+  );
+  return rows[0] ?? null;
+}
+
+async function touchChat(caller: Caller, chatId: string) {
+  await rest(caller, `chats?id=eq.${chatId}`, {
+    method: "PATCH",
+    body: { updated_at: new Date().toISOString() },
+  });
+}
+
+async function kickoffCrew(
+  crew: { url: string; token: string },
+  message: string,
+  model: string,
+  history: HistoryTurn[],
+): Promise<string> {
+  const res = await fetch(`${crew.url}/kickoff`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${crew.token}`,
+    },
+    body: JSON.stringify({
+      inputs: {
+        project_description: message,
+        conversation_history: formatHistory(history),
+        model,
+      },
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`Agent request failed (${res.status})`);
+  }
+
+  const data = await res.json().catch(() => null);
+  const kickoffId =
+    typeof data === "string" ? data : data?.kickoff_id ?? data?.uuid ?? data?.task_id ?? data?.id;
+  if (!kickoffId) {
+    throw new Error("The agent backend did not return a job id");
+  }
+  return String(kickoffId);
+}
+
+async function fetchCrewStatus(
+  crew: { url: string; token: string },
+  crewJobId: string,
+): Promise<Record<string, unknown> | null> {
+  const res = await fetch(`${crew.url}/status/${encodeURIComponent(crewJobId)}`, {
+    method: "GET",
+    headers: { Authorization: `Bearer ${crew.token}` },
+  });
+  if (!res.ok) return null;
+  const data = await res.json().catch(() => null);
+  return data && typeof data === "object" ? (data as Record<string, unknown>) : null;
+}
+
+function completedResult(job: ChatJob): PollResult {
+  return {
+    state: "COMPLETED",
+    reply: job.result ?? "",
+    steps: job.steps ?? [],
+    progress: job.progress,
+    error: null,
+  };
+}
+
+function failedResult(job: ChatJob): PollResult {
+  return {
+    state: "FAILED",
+    error: job.error ?? "The agent team failed.",
+    progress: job.progress,
+  };
+}
+
+// Saves the reply once: the reply_saved flag is claimed atomically before the message is inserted.
+async function deliverReply(caller: Caller, job: ChatJob): Promise<PollResult> {
+  if (job.assistant_message_id) return completedResult(job);
+  if (job.result === null) return { state: "RUNNING", progress: job.progress };
+
+  const claimed = await updateJob(caller, job.id, { reply_saved: true }, "&reply_saved=is.false");
+  if (claimed.length === 0) return { state: "RUNNING", progress: job.progress };
+
+  const message = await insertAssistantMessage(caller, job.chat_id, job.result);
+  if (!message) {
+    await updateJob(caller, job.id, { reply_saved: false });
+    return { state: "RUNNING", progress: job.progress };
+  }
+
+  await updateJob(caller, job.id, { assistant_message_id: message.id });
+  await touchChat(caller, job.chat_id);
+  return completedResult({ ...job, assistant_message_id: message.id });
+}
+
+async function pollJob(
+  caller: Caller,
+  jobId: string,
+  crew: { url: string; token: string },
+): Promise<PollResult | null> {
+  const job = await loadJob(caller, jobId);
+  if (!job) return null;
+
+  if (job.status === "SUCCESS") return deliverReply(caller, job);
+  if (job.status === "FAILED" || job.status === "REVOKED") return failedResult(job);
+
+  if (Date.now() - Date.parse(job.created_at) > MAX_JOB_AGE_MS) {
+    const reason = "The agent team did not finish in time.";
+    await updateJob(caller, job.id, { status: "FAILED", error: reason });
+    return { state: "FAILED", error: reason, progress: job.progress };
+  }
+
+  if (!job.crew_job_id) return { state: "RUNNING", progress: job.progress };
+
+  const remote = await fetchCrewStatus(crew, job.crew_job_id);
+  if (!remote) {
+    return { state: job.status === "PENDING" ? "PENDING" : "RUNNING", progress: job.progress };
+  }
+
+  const remoteState = String(remote.state ?? "").toUpperCase();
+  const progress = normalizeProgress(remote.progress) ?? job.progress;
+
+  if (remoteState === "SUCCESS" || remoteState === "COMPLETED" || remoteState === "FINISHED") {
+    const { reply, steps } = extractResult(remote);
+    const [updated] = await updateJob(caller, job.id, { status: "SUCCESS", result: reply, steps, progress });
+    if (!updated) return { state: "RUNNING", progress };
+    return deliverReply(caller, updated);
+  }
+
+  if (remoteState === "FAILED" || remoteState === "ERROR" || remoteState === "NOT FOUND") {
+    const reason =
+      typeof remote.error === "string" && remote.error ? remote.error : "The agent team failed.";
+    await updateJob(caller, job.id, { status: "FAILED", error: reason, progress });
+    return { state: "FAILED", error: reason, progress };
+  }
+
+  if (remoteState === "REVOKED") {
+    const reason = "The agent task was cancelled.";
+    await updateJob(caller, job.id, { status: "REVOKED", error: reason, progress });
+    return { state: "FAILED", error: reason, progress };
+  }
+
+  const status = remoteState === "PENDING" ? "PENDING" : "RUNNING";
+  await updateJob(caller, job.id, { status, progress });
+  return { state: status, progress };
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
     return new Response(null, { status: 200, headers: corsHeaders });
@@ -97,19 +341,25 @@ Deno.serve(async (req: Request) => {
 
     const crew = getCrewConfig();
 
-    // Status poll: { jobId } — a crew run can take many minutes, so the browser
-    // polls instead of holding one long request open.
+    // Status check: { jobId } returns the job's current state; the browser polls this.
     const jobId = typeof body?.jobId === "string" ? body.jobId.trim() : "";
     if (jobId) {
-      return json(await readJob(jobId, crew));
+      if (!UUID_PATTERN.test(jobId)) return json({ error: "Job not found" }, 404);
+      const result = await pollJob(caller, jobId, crew);
+      if (!result) return json({ error: "Job not found" }, 404);
+      return json(result);
     }
 
     const message = body?.message;
     const model = typeof body?.model === "string" ? body.model : "gpt-4o";
     const history: HistoryTurn[] = Array.isArray(body?.history) ? body.history : [];
+    const chatId = typeof body?.chatId === "string" ? body.chatId.trim() : "";
 
     if (!message || typeof message !== "string") {
       return json({ error: "Message is required" }, 400);
+    }
+    if (!UUID_PATTERN.test(chatId)) {
+      return json({ error: "Chat is required" }, 400);
     }
 
     const used = await messagesSentToday(caller);
@@ -120,46 +370,20 @@ Deno.serve(async (req: Request) => {
       );
     }
 
-    const agentResponse = await fetch(`${crew.url}/kickoff`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${crew.token}`,
-      },
-      body: JSON.stringify({
-        inputs: {
-          project_description: message,
-          conversation_history: formatHistory(history),
-          model,
-        },
-      }),
-    });
-
-    if (!agentResponse.ok) {
-      const errorText = await agentResponse.text().catch(() => "");
-      return json(
-        {
-          error: `Agent request failed (${agentResponse.status})`,
-          details: errorText.slice(0, 500),
-        },
-        502,
-      );
+    const job = await createJob(caller, chatId);
+    if (!job) {
+      return json({ error: "Chat not found" }, 404);
     }
 
-    const agentData = await agentResponse.json();
-
-    // /kickoff returns a UUID; poll /status/:uuid for the result
-    const taskId =
-      typeof agentData === "string"
-        ? agentData
-        : agentData?.uuid ?? agentData?.task_id ?? agentData?.id ?? agentData?.kickoff_id ?? null;
-
-    if (taskId) {
-      return json({ jobId: String(taskId), state: "STARTED" });
+    try {
+      const crewJobId = await kickoffCrew(crew, message, model, history);
+      await updateJob(caller, job.id, { crew_job_id: crewJobId, status: "PENDING" });
+      return json({ jobId: job.id, state: "PENDING" });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : "Agent request failed";
+      await updateJob(caller, job.id, { status: "FAILED", error: reason });
+      return json({ error: reason }, 502);
     }
-
-    const { reply, steps } = extractResult(agentData);
-    return json({ state: "COMPLETED", reply, steps });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal server error";
 
@@ -174,42 +398,7 @@ Deno.serve(async (req: Request) => {
   }
 });
 
-async function readJob(jobId: string, crew: { url: string; token: string }) {
-  const res = await fetch(`${crew.url}/status/${encodeURIComponent(jobId)}`, {
-    method: "GET",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${crew.token}`,
-    },
-  });
-
-  if (!res.ok) {
-    return { state: "RUNNING", error: null, progress: null };
-  }
-
-  const data = await res.json().catch(() => null);
-  if (!data || typeof data !== "object") {
-    return { state: "RUNNING", error: null, progress: null };
-  }
-
-  const d = data as Record<string, unknown>;
-  const rawState = String(d.state ?? "").toUpperCase();
-  const progress = normalizeProgress(d.progress);
-
-  if (rawState === "COMPLETED" || rawState === "SUCCESS" || rawState === "FINISHED") {
-    const { reply, steps } = extractResult(d);
-    return { state: "COMPLETED", reply, steps, progress, error: null };
-  }
-
-  if (rawState === "FAILED" || rawState === "ERROR" || rawState === "NOT FOUND") {
-    const detail = typeof d.status === "string" && d.status ? d.status : "The agent team failed.";
-    return { state: "FAILED", error: detail, progress, reply: null };
-  }
-
-  return { state: rawState === "PENDING" ? "PENDING" : "RUNNING", progress, error: null };
-}
-
-function normalizeProgress(value: unknown) {
+function normalizeProgress(value: unknown): Progress | null {
   if (!value || typeof value !== "object") return null;
   const p = value as Record<string, unknown>;
   return {

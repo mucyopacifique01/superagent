@@ -16,7 +16,24 @@ interface ChatAppProps {
   onSignOut: () => void;
 }
 
+interface PendingJob {
+  jobId: string;
+  chatId: string;
+}
+
+interface CrewJobStatus {
+  state: string;
+  reply?: string | null;
+  steps?: AgentStep[];
+  error?: string | null;
+  progress?: { completed: number | null; total: number | null; current: string | null; current_agent: string | null } | null;
+}
+
 const REQUEST_TIMEOUT_MS = 150_000;
+const POLL_INTERVAL_MS = 4000;
+const MAX_CONSECUTIVE_POLL_FAILURES = 10;
+const ACTIVE_JOB_FILTER =
+  'status.in.(STARTING,PENDING,RUNNING),and(status.eq.SUCCESS,assistant_message_id.is.null)';
 
 async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs = REQUEST_TIMEOUT_MS): Promise<Response> {
   const controller = new AbortController();
@@ -25,7 +42,7 @@ async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs = RE
     return await fetch(input, { ...init, signal: controller.signal });
   } catch (err) {
     if (err instanceof DOMException && err.name === 'AbortError') {
-      throw new Error('The request timed out. The agent team may still be finishing, try again.');
+      throw new Error('The request timed out. Please try again.');
     }
     throw err;
   } finally {
@@ -40,12 +57,14 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [activeChatId, setActiveChatId] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [pendingJob, setPendingJob] = useState<PendingJob | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [agentSteps, setAgentSteps] = useState<AgentStep[]>([]);
   const [selectedModel, setSelectedModel] = useState('gpt-4o');
   const [backend, setBackend] = useState<BackendType>('crewai');
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const activeChatIdRef = useRef<string | null>(null);
 
   const loadChats = useCallback(async () => {
     const { data, error } = await supabase
@@ -79,6 +98,32 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
   }, [loadChats]);
 
   useEffect(() => {
+    activeChatIdRef.current = activeChatId;
+  }, [activeChatId]);
+
+  // Reopen an agent run that was still in progress when the page was last open.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const { data, error } = await supabase
+        .from('chat_jobs')
+        .select('id, chat_id')
+        .or(ACTIVE_JOB_FILTER)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (cancelled || error || !data) return;
+      const chatId = data.chat_id as string;
+      setPendingJob({ jobId: data.id as string, chatId });
+      setActiveChatId(chatId);
+      loadMessages(chatId);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [loadMessages]);
+
+  useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages, loading, agentSteps]);
 
@@ -105,6 +150,10 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
       return;
     }
     setChats((prev) => prev.filter((c) => c.id !== chatId));
+    if (pendingJob?.chatId === chatId) {
+      setPendingJob(null);
+      setAgentSteps([]);
+    }
     if (activeChatId === chatId) {
       setActiveChatId(null);
       setMessages([]);
@@ -152,14 +201,14 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     };
   };
 
-  // A crew run can take many minutes, so the backend returns a job id and we poll it.
-  const startCrewJob = async (userMessage: string, history: { role: string; content: string }[]) => {
+  // Starts the agent run on the server and returns its job id right away.
+  const startCrewJob = async (userMessage: string, history: { role: string; content: string }[], chatId: string) => {
     const response = await fetchWithTimeout(
       crewEndpoint,
       {
         method: 'POST',
         headers: await authHeaders(),
-        body: JSON.stringify({ message: userMessage, history, model: selectedModel }),
+        body: JSON.stringify({ message: userMessage, history, model: selectedModel, chatId }),
       },
       60_000,
     );
@@ -168,16 +217,13 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     if (!response.ok) {
       throw new Error(data?.error ?? `Request failed (${response.status})`);
     }
-    if (typeof data?.reply === 'string') {
-      return { jobId: null as string | null, reply: data.reply as string, steps: (data.steps ?? []) as AgentStep[] };
-    }
     if (!data?.jobId) {
       throw new Error('The server did not return a job id');
     }
-    return { jobId: String(data.jobId), reply: null as string | null, steps: [] as AgentStep[] };
+    return String(data.jobId);
   };
 
-  const pollCrewJob = async (jobId: string) => {
+  const pollCrewJob = async (jobId: string): Promise<CrewJobStatus> => {
     const response = await fetchWithTimeout(
       crewEndpoint,
       { method: 'POST', headers: await authHeaders(), body: JSON.stringify({ jobId }) },
@@ -187,48 +233,10 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     if (!response.ok) {
       throw new Error(data?.error ?? `Request failed (${response.status})`);
     }
-    return data as {
-      state: string;
-      reply?: string | null;
-      steps?: AgentStep[];
-      error?: string | null;
-      progress?: { completed: number | null; total: number | null; current: string | null; current_agent: string | null } | null;
-    };
-  };
-
-  const waitForCrewJob = async (jobId: string) => {
-    const deadline = Date.now() + 15 * 60 * 1000;
-
-    while (Date.now() < deadline) {
-      await new Promise((resolve) => setTimeout(resolve, 4000));
-
-      let status;
-      try {
-        status = await pollCrewJob(jobId);
-      } catch {
-        continue; // transient network hiccup, keep waiting
-      }
-
-      if (status.progress) {
-        const { completed, total, current_agent, current } = status.progress;
-        setAgentSteps([
-          {
-            agent: current_agent ?? current ?? 'Agent team working',
-            content: total ? `${completed ?? 0}/${total} tasks complete` : '',
-            status: 'active',
-          },
-        ]);
-      }
-
-      if (status.state === 'COMPLETED' && typeof status.reply === 'string') {
-        return { reply: status.reply, steps: status.steps ?? [] };
-      }
-      if (status.state === 'FAILED') {
-        throw new Error(status.error ?? 'The agent team failed.');
-      }
+    if (typeof data?.state !== 'string') {
+      throw new Error('Unexpected response from the agent service');
     }
-
-    throw new Error('The agent team is still running after 15 minutes. Try a shorter request.');
+    return data as CrewJobStatus;
   };
 
   // Optional local FastAPI crew backend (only used when VITE_FASTAPI_URL is set)
@@ -249,6 +257,92 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
     }
     throw new Error(data?.message ?? 'FastAPI returned an error');
   };
+
+  const saveAssistantMessage = async (chatId: string, content: string) => {
+    const { data, error } = await supabase
+      .from('messages')
+      .insert({ chat_id: chatId, role: 'assistant', content })
+      .select()
+      .single();
+
+    if (error || !data) {
+      console.error('Saving assistant message failed', error);
+      throw new Error('Failed to save assistant response');
+    }
+
+    setMessages((prev) => [...prev, data as Message]);
+
+    await supabase
+      .from('chats')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', chatId);
+
+    loadChats();
+  };
+
+  // Polls the server until the run finishes; the server saves the reply itself.
+  useEffect(() => {
+    if (!pendingJob) return;
+
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let failures = 0;
+
+    const tick = async () => {
+      try {
+        const status = await pollCrewJob(pendingJob.jobId);
+        failures = 0;
+        if (cancelled) return;
+
+        if (status.state === 'COMPLETED') {
+          setPendingJob(null);
+          setAgentSteps((status.steps ?? []).map((s) => ({ ...s, status: 'done' as const })));
+          if (activeChatIdRef.current === pendingJob.chatId) {
+            await loadMessages(pendingJob.chatId);
+          }
+          loadChats();
+          return;
+        }
+
+        if (status.state === 'FAILED') {
+          setPendingJob(null);
+          setAgentSteps([]);
+          setError(status.error ?? 'The agent team failed.');
+          return;
+        }
+
+        if (status.progress) {
+          const { completed, total, current_agent, current } = status.progress;
+          setAgentSteps([
+            {
+              agent: current_agent ?? current ?? 'Agent team working',
+              content: total ? `${completed ?? 0}/${total} tasks complete` : '',
+              status: 'active',
+            },
+          ]);
+        }
+      } catch (err) {
+        failures += 1;
+        if (failures >= MAX_CONSECUTIVE_POLL_FAILURES) {
+          if (!cancelled) {
+            setPendingJob(null);
+            setAgentSteps([]);
+            setError(err instanceof Error ? err.message : 'Lost contact with the agent team.');
+          }
+          return;
+        }
+      }
+
+      if (!cancelled) timer = setTimeout(tick, POLL_INTERVAL_MS);
+    };
+
+    tick();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [pendingJob, loadMessages, loadChats]);
 
   const handleSend = async (text: string) => {
     setError(null);
@@ -297,55 +391,20 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
       currentMessages = [...currentMessages, userMsg];
       setMessages(currentMessages);
 
-      // Honest progress: one working indicator until the backend replies
-      setAgentSteps([{ agent: 'Your agent team is working', content: '', status: 'active' }]);
-
       // Conversation memory: everything except the message we just sent
       const history = currentMessages
         .slice(0, -1)
         .map((m) => ({ role: m.role, content: m.content }));
 
-      let reply: string;
-      let steps: AgentStep[] = [];
-
       if (backend === 'fastapi' && FASTAPI_BASE) {
         const result = await callFastApi(text, history);
-        reply = result.reply;
-        steps = result.steps;
+        setAgentSteps(result.steps.map((s) => ({ ...s, status: 'done' as const })));
+        await saveAssistantMessage(chatId, result.reply);
       } else {
-        const started = await startCrewJob(text, history);
-        if (started.reply !== null) {
-          reply = started.reply;
-          steps = started.steps;
-        } else {
-          const finished = await waitForCrewJob(started.jobId as string);
-          reply = finished.reply;
-          steps = finished.steps;
-        }
+        const jobId = await startCrewJob(text, history, chatId);
+        setAgentSteps([{ agent: 'Your agent team is working', content: '', status: 'active' }]);
+        setPendingJob({ jobId, chatId });
       }
-
-      // Only show steps the backend actually reported
-      setAgentSteps(steps.length > 0 ? steps.map((s) => ({ ...s, status: 'done' })) : []);
-
-      const { data: aiMsgData, error: aiMsgError } = await supabase
-        .from('messages')
-        .insert({ chat_id: chatId, role: 'assistant', content: reply })
-        .select()
-        .single();
-
-      if (aiMsgError || !aiMsgData) {
-        console.error('Saving assistant message failed', aiMsgError);
-        throw new Error('Failed to save assistant response');
-      }
-
-      setMessages((prev) => [...prev, aiMsgData as Message]);
-
-      await supabase
-        .from('chats')
-        .update({ updated_at: new Date().toISOString() })
-        .eq('id', chatId);
-
-      loadChats();
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Something went wrong';
       setError(msg);
@@ -354,6 +413,9 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
       setLoading(false);
     }
   };
+
+  const showWorking = loading || (pendingJob !== null && pendingJob.chatId === activeChatId);
+  const inputBusy = loading || pendingJob !== null;
 
   return (
     <div className="flex h-screen bg-[#0f0f0f] text-neutral-100 overflow-hidden">
@@ -387,9 +449,9 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
 
           <div className="flex items-center gap-2">
             {FASTAPI_BASE && (
-              <BackendSelector value={backend} onChange={setBackend} disabled={loading} />
+              <BackendSelector value={backend} onChange={setBackend} disabled={inputBusy} />
             )}
-            <ModelSelector value={selectedModel} onChange={setSelectedModel} disabled={loading} />
+            <ModelSelector value={selectedModel} onChange={setSelectedModel} disabled={inputBusy} />
 
             <button
               onClick={handleExport}
@@ -406,7 +468,7 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
 
         <div className="flex-1 overflow-y-auto">
           <div className="max-w-3xl mx-auto py-4">
-            {messages.length === 0 && !loading && (
+            {messages.length === 0 && !showWorking && (
               <div className="flex flex-col items-center justify-center py-20 px-4 text-center">
                 <div className="w-14 h-14 rounded-2xl bg-gradient-to-br from-blue-500 to-emerald-500 flex items-center justify-center mb-4">
                   <Sparkles size={26} className="text-white" />
@@ -425,9 +487,9 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
               <ChatMessage key={msg.id} message={msg} />
             ))}
 
-            {loading && <LoadingSpinner steps={agentSteps} />}
+            {showWorking && <LoadingSpinner steps={agentSteps} />}
 
-            {!loading && agentSteps.length > 0 && (
+            {!showWorking && agentSteps.length > 0 && (
               <AgentSteps steps={agentSteps} />
             )}
 
@@ -442,7 +504,7 @@ export function ChatApp({ user, onSignOut }: ChatAppProps) {
           </div>
         </div>
 
-        <ChatInput onSend={handleSend} disabled={loading} />
+        <ChatInput onSend={handleSend} disabled={inputBusy} />
       </main>
     </div>
   );
