@@ -518,8 +518,16 @@ function formatHistory(history: HistoryTurn[]): string {
 }
 
 async function startAdvanced(
+  req: Request,
   caller: Caller,
-  opts: { message: string; history: HistoryTurn[]; model: string; chatId?: string; routing: Routing },
+  opts: {
+    message: string;
+    history: HistoryTurn[];
+    model: string;
+    chatId?: string;
+    routing: Routing;
+    stream: boolean;
+  },
 ) {
   const crew = getCrewConfig();
   const startedAt = Date.now();
@@ -538,7 +546,30 @@ async function startAdvanced(
 
   if (!agentResponse.ok) {
     const errorText = await agentResponse.text().catch(() => "");
-    return json({ error: `Agent request failed (${agentResponse.status})`, details: errorText.slice(0, 500) }, 502);
+
+    if (!opts.routing.forced && FAST_API_KEY && agentResponse.status >= 500) {
+      const fallbackRouting: Routing = {
+        ...opts.routing,
+        mode: "fast",
+        reason: `Advanced agent unavailable (${agentResponse.status}); answered with the fast model`,
+      };
+      return await handleFast(req, caller, {
+        message: opts.message,
+        history: opts.history,
+        routing: fallbackRouting,
+        chatId: opts.chatId,
+        stream: opts.stream,
+      });
+    }
+
+    const message =
+      agentResponse.status === 503
+        ? "The advanced agent service is temporarily unavailable. Switch to Auto or Fast mode and try again."
+        : `Agent request failed (${agentResponse.status})`;
+    return json(
+      { error: message, details: errorText.slice(0, 500), code: "ADVANCED_PROVIDER_ERROR" },
+      agentResponse.status === 503 ? 503 : 502,
+    );
   }
 
   const agentData = await agentResponse.json();
@@ -828,7 +859,7 @@ Deno.serve(async (req: Request) => {
       });
     }
 
-    return await startAdvanced(caller, { message, history, model, chatId, routing });
+    return await startAdvanced(req, caller, { message, history, model, chatId, routing, stream: wantsStream });
   } catch (err) {
     const message = err instanceof Error ? err.message : "Internal server error";
     if (message.includes("CrewAI is not configured")) {
